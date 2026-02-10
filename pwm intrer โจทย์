@@ -1,0 +1,143 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <LCD_I2C.h>
+
+// --- 1. ตั้งค่า WiFi และ MQTT ---
+const char* ssid = "Bomba";
+const char* password = "kawpod000";
+const char* mqtt_server = "test.mosquitto.org";
+const char* mqtt_client_id = "finally_pwm_interrupt"; 
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// --- 2. ตั้งค่าอุปกรณ์ Hardware ---
+LCD_I2C lcd(0x23, 16, 2); 
+const int pinEN1 = 23; 
+const int pinIN1 = 25; 
+const int pinIN2 = 19; 
+const int ledStatus = 18; 
+const int buttonPin = 32; 
+
+// --- 3. PWM Settings ---
+const int freq = 1000;
+const int resolution = 8;
+int currentSpeed = 200; 
+
+// // --- เพิ่มตรงนี้: ตัวแปรสถานะสำหรับ Interrupt ---
+volatile bool buttonPressedFlag = false; // Flag แจ้งเตือนเมื่อมีการกดปุ่ม
+unsigned long lastInterruptTime = 0;    // สำหรับทำ Debounce ใน Interrupt
+int mode = 3; // เริ่มต้นที่โหมดหยุด (Stop)
+
+// // --- เพิ่มตรงนี้: ฟังก์ชัน ISR (Interrupt Service Routine) ---
+// // ฟังก์ชันนี้จะทำงานทันทีเมื่อมีการกดปุ่ม โดยไม่สนว่า CPU กำลังทำอะไรอยู่
+void IRAM_ATTR handleButtonInterrupt() {
+  unsigned long interruptTime = millis();
+  // Software Debounce 200ms ป้องกันสัญญาณรบกวน
+  if (interruptTime - lastInterruptTime > 200) {
+    buttonPressedFlag = true;
+    lastInterruptTime = interruptTime;
+  }
+}
+
+void updateAction(int newMode, int speed) {
+  mode = newMode;
+  currentSpeed = speed;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+
+  if (mode == 1) { // ทวนเข็ม
+    ledcWrite(pinEN1, currentSpeed); 
+    digitalWrite(pinIN1, HIGH); digitalWrite(pinIN2, LOW);
+    digitalWrite(ledStatus, HIGH);
+    lcd.print("Motor: REVERSE");
+    lcd.setCursor(0, 1); lcd.print("PWM: "); lcd.print(currentSpeed);
+    client.publish("esp32/motor/status", "REVERSE");
+  } 
+  else if (mode == 2) { // ตามเข็ม
+    ledcWrite(pinEN1, currentSpeed); 
+    digitalWrite(pinIN1, LOW); digitalWrite(pinIN2, HIGH);
+    digitalWrite(ledStatus, HIGH);
+    lcd.print("Motor: FORWARD");
+    lcd.setCursor(0, 1); lcd.print("PWM: "); lcd.print(currentSpeed);
+    client.publish("esp32/motor/status", "FORWARD");
+  } 
+  else { // หยุด
+    ledcWrite(pinEN1, 0); 
+    digitalWrite(pinIN1, LOW); digitalWrite(pinIN2, LOW);
+    digitalWrite(ledStatus, LOW);
+    lcd.print("Motor: STOPPED");
+    lcd.setCursor(0, 1); lcd.print("LED: OFF");
+    client.publish("esp32/motor/status", "STOPPED");
+    mode = 3; 
+  }
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (int i = 0; i < length; i++) message += (char)payload[i];
+  
+  if (String(topic) == "esp32/motor/control") {
+    if (message == "FORWARD") updateAction(2, currentSpeed);
+    else if (message == "REVERSE") updateAction(1, currentSpeed);
+    else if (message == "STOP") updateAction(3, 0);
+  }
+  else if (String(topic) == "esp32/motor/speed") {
+    int newSpeed = message.toInt();
+    if (newSpeed >= 0 && newSpeed <= 255) {
+      currentSpeed = newSpeed;
+      if (mode != 3) updateAction(mode, currentSpeed);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  
+  ledcAttach(pinEN1, freq, resolution);
+
+  lcd.begin(); 
+  lcd.backlight();
+  lcd.print("WiFi Connecting");
+
+  pinMode(pinIN1, OUTPUT); pinMode(pinIN2, OUTPUT);
+  pinMode(ledStatus, OUTPUT); 
+
+  // // --- แก้ไขตรงนี้: ตั้งค่า Interrupt ให้กับปุ่มกด ---
+  pinMode(buttonPin, INPUT_PULLUP);
+  // ตั้งค่าให้ดักจับสัญญาณช่วงขาลง (FALLING) คือตอนที่กดปุ่มลงไป
+  attachInterrupt(digitalPinToInterrupt(buttonPin), handleButtonInterrupt, FALLING);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); }
+  
+  lcd.clear();
+  lcd.print("WiFi Connected");
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    if (client.connect(mqtt_client_id)) {
+      client.subscribe("esp32/motor/control");
+      client.subscribe("esp32/motor/speed");
+    } else { delay(5000); }
+  }
+}
+
+void loop() {
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  // // --- แก้ไขตรงนี้: ตรวจสอบ Flag จาก Interrupt แทนการใช้ digitalRead ---
+  if (buttonPressedFlag) {
+    buttonPressedFlag = false; // รีเซ็ต Flag
+    mode++;
+    if (mode > 3) mode = 1;
+    updateAction(mode, (mode == 3 ? 0 : currentSpeed));
+    Serial.println("Interrupt Triggered: Mode Changed");
+  }
+}
