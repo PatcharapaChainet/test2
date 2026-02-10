@@ -1,0 +1,48 @@
+#include <Wire.h>
+
+// --- 1. ตั้งค่าพื้นฐาน ---
+#define PCF8574_ADDR 0x20  // ตรวจสอบ Address (0x20 - 0x27 หรือ 0x38 - 0x3F)
+const int button_bit = 0;  // ปุ่มกดต่อที่ขา P0
+const int led_bit = 7;     // LED ต่อที่ขา P7
+
+// --- 2. ตัวแปรเก็บสถานะ Buffer ---
+uint8_t bitConfig = 0xFF;  // เริ่มต้นเป็น 1 ทั้งหมด (LED ดับ และเตรียมขา Input)
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22); // กำหนดขา SDA=21, SCL=22 สำหรับ ESP32
+  
+  // เขียนค่าเริ่มต้นไปที่ PCF8574
+  Wire.beginTransmission(PCF8574_ADDR);
+  Wire.write(bitConfig); 
+  Wire.endTransmission();
+  
+  Serial.println("I2C Ready: Button(P0), LED(P7)");
+}
+
+void loop() {
+  // 1. อ่านสถานะจาก PCF8574
+  uint8_t currentData = 0xFF;
+  Wire.requestFrom(PCF8574_ADDR, 1);
+  if (Wire.available()) {
+    currentData = Wire.read();
+  }
+
+  // 2. ตรวจสอบปุ่ม P0 (กดติด-ปล่อยดับ)
+  // ถ้ากดปุ่ม (Signal เป็น 0)
+  if (bitRead(currentData, button_bit) == 0) {
+    bitClear(bitConfig, led_bit); // สั่ง LED ติด (Sink Current = 0)
+  } else {
+    bitSet(bitConfig, led_bit);   // สั่ง LED ดับ (High Impedance = 1)
+  }
+
+  // 3. รักษาบิต 0 ให้เป็น 1 เสมอเพื่อให้เป็นขา Input
+  bitSet(bitConfig, button_bit);
+
+  // 4. ส่งข้อมูลกลับไปควบคุม
+  Wire.beginTransmission(PCF8574_ADDR);
+  Wire.write(bitConfig);
+  Wire.endTransmission();
+
+  delay(20); // ป้องกันสัญญาณสั่น (Debounce)
+}
