@@ -1,0 +1,159 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <LCD_I2C.h>
+
+// --- 1. ตั้งค่า WiFi และ MQTT ---
+const char* ssid = "Bomba";
+const char* password = "kawpod000";
+const char* mqtt_server = "test.mosquitto.org";
+const char* mqtt_client_id = "finally_pwm_robot"; 
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// --- 2. ตั้งค่าอุปกรณ์ Hardware ---
+LCD_I2C lcd(0x23, 16, 2); 
+
+const int pinEN1 = 23; 
+const int pinIN1 = 25; 
+const int pinIN2 = 19; 
+const int ledStatus = 18; 
+const int buttonPin = 32; 
+
+// // --- เพิ่มตรงนี้: การตั้งค่า PWM สำหรับควบคุมความเร็วมอเตอร์ ---
+const int freq = 1000;      // ความถี่สัญญาณ 1kHz
+const int resolution = 8;    // ความละเอียด 8 บิต (ค่า 0-255)
+int currentSpeed = 200;      // ค่าความเร็วเริ่มต้น
+
+// --- 3. ตัวแปรสถานะและ Debounce ---
+int mode = 0;           // 0:Stop, 1:Reverse, 2:Forward
+int lastMoveMode = 1;   
+bool lastButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
+
+// // --- แก้ไขตรงนี้: เพิ่มพารามิเตอร์ speed เข้าไปในฟังก์ชัน ---
+void updateAction(int newMode, int speed) {
+  mode = newMode;
+  currentSpeed = speed; // อัปเดตค่าความเร็วปัจจุบัน
+  lcd.clear();
+  lcd.setCursor(0, 0);
+
+  if (mode == 1) { // ทวนเข็ม
+    // // --- แก้ไขตรงนี้: ใช้ ledcWrite แทน digitalWrite เพื่อส่งสัญญาณ PWM ---
+    ledcWrite(pinEN1, currentSpeed); 
+    digitalWrite(pinIN1, HIGH); digitalWrite(pinIN2, LOW);
+    digitalWrite(ledStatus, HIGH);
+    lcd.print("Motor: REVERSE");
+    lcd.setCursor(0, 1); lcd.print("PWM Speed: "); lcd.print(currentSpeed);
+    lastMoveMode = 1;
+    client.publish("esp32/motor/status", "REVERSE");
+  } 
+  else if (mode == 2) { // ตามเข็ม
+    // // --- แก้ไขตรงนี้: ใช้ ledcWrite แทน digitalWrite เพื่อส่งสัญญาณ PWM ---
+    ledcWrite(pinEN1, currentSpeed); 
+    digitalWrite(pinIN1, LOW); digitalWrite(pinIN2, HIGH);
+    digitalWrite(ledStatus, HIGH);
+    lcd.print("Motor: FORWARD");
+    lcd.setCursor(0, 1); lcd.print("PWM Speed: "); lcd.print(currentSpeed);
+    lastMoveMode = 2;
+    client.publish("esp32/motor/status", "FORWARD");
+  } 
+  else { // หยุด
+    // // --- แก้ไขตรงนี้: สั่งให้ PWM เป็น 0 เพื่อหยุดมอเตอร์ ---
+    ledcWrite(pinEN1, 0); 
+    digitalWrite(pinIN1, LOW); digitalWrite(pinIN2, LOW);
+    digitalWrite(ledStatus, LOW);
+    lcd.print("Motor: STOPPED");
+    lcd.setCursor(0, 1); lcd.print("LED: OFF");
+    client.publish("esp32/motor/status", "STOPPED");
+    mode = 3; 
+  }
+}
+
+// ฟังก์ชันรับข้อความจาก MQTT
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (int i = 0; i < length; i++) message += (char)payload[i];
+  
+  if (String(topic) == "esp32/motor/control") {
+    if (message == "FORWARD") updateAction(2, currentSpeed);
+    else if (message == "REVERSE") updateAction(1, currentSpeed);
+    else if (message == "STOP") updateAction(3, 0);
+  }
+  // // --- เพิ่มตรงนี้: รับค่าความเร็วจาก Topic motor/speed ---
+  else if (String(topic) == "esp32/motor/speed") {
+    int newSpeed = message.toInt();
+    if (newSpeed >= 0 && newSpeed <= 255) {
+      currentSpeed = newSpeed;
+      // ถ้ามอเตอร์กำลังหมุนอยู่ ให้เปลี่ยนความเร็วทันที
+      if (mode == 1 || mode == 2) updateAction(mode, currentSpeed);
+    }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  
+  // // --- เพิ่มตรงนี้: เปิดใช้งานฟังก์ชัน PWM ที่ขา pinEN1 (GPIO 23) ---
+  ledcAttach(pinEN1, freq, resolution);
+
+  lcd.begin(); 
+  lcd.backlight();
+  lcd.print("WiFi Connecting");
+
+  // // --- แก้ไขตรงนี้: pinEN1 ไม่ต้องใช้ pinMode(OUTPUT) เพราะใช้ ledcAttach แล้ว ---
+  pinMode(pinIN1, OUTPUT); pinMode(pinIN2, OUTPUT);
+  pinMode(ledStatus, OUTPUT); 
+  pinMode(buttonPin, INPUT_PULLUP);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  
+  lcd.clear();
+  lcd.print("WiFi Connected");
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    if (client.connect(mqtt_client_id)) {
+      client.subscribe("esp32/motor/control");
+      // // --- เพิ่มตรงนี้: Subscribe ช่องรับค่าความเร็ว ---
+      client.subscribe("esp32/motor/speed");
+    } else {
+      delay(5000);
+    }
+  }
+}
+
+void loop() {
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  int reading = digitalRead(buttonPin);
+  if (reading != lastButtonState) {
+    lastDebounceTime = millis();
+  }
+
+  if ((millis() - lastDebounceTime) > debounceDelay) {
+    static bool buttonPressed = false;
+    if (reading == LOW && !buttonPressed) {
+      buttonPressed = true;
+      mode++;
+      if (mode > 3) mode = 1;
+      
+      // // --- แก้ไขตรงนี้: ส่งค่า speed เข้าไปตอนเรียกฟังก์ชัน (ถ้าหยุดส่ง 0) ---
+      updateAction(mode, (mode == 3 ? 0 : currentSpeed));
+    } else if (reading == HIGH) {
+      buttonPressed = false;
+    }
+  }
+  lastButtonState = reading;
+}
