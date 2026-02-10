@@ -1,0 +1,145 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include <LCD_I2C.h>
+
+// --- 1. ตั้งค่า WiFi และ MQTT ---
+const char* ssid = "Bomba";
+const char* password = "kawpod000";
+const char* mqtt_server = "test.mosquitto.org";
+const char* mqtt_client_id = "esp32_robot_finally"; 
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// --- 2. ตั้งค่า Hardware & I2C Address ---
+LCD_I2C lcd(0x23, 16, 2); 
+#define PCF8574_ADDR 0x20  // Address ของตัวขยายขา
+const int pcf_button_bit = 0; // ปุ่ม I2C ที่ P0
+const int pcf_led_bit = 7;    // LED I2C ที่ P7
+
+const int pinEN1 = 23; 
+const int pinIN1 = 25; 
+const int pinIN2 = 19; 
+const int ledStatus = 18; 
+const int nativeButtonPin = 32; 
+
+// --- 3. ตัวแปรสถานะ ---
+int mode = 0; 
+int lastMoveMode = 1; 
+uint8_t pcf_buffer = 0xFF; // เก็บสถานะบิตสำหรับ PCF8574
+bool lastNativeButtonState = HIGH;
+unsigned long lastDebounceTime = 0;
+unsigned long debounceDelay = 50;
+
+// ฟังก์ชันเขียนข้อมูลไปยัง PCF8574 (I2C)
+void pcf_write(uint8_t data) {
+  Wire.beginTransmission(PCF8574_ADDR);
+  Wire.write(data);
+  Wire.endTransmission();
+}
+
+// ฟังก์ชันสั่งการหลัก
+void updateAction(int newMode) {
+  mode = newMode;
+  lcd.clear();
+  lcd.setCursor(0, 0);
+
+  if (mode == 1) { // Forward
+    digitalWrite(pinEN1, HIGH); digitalWrite(pinIN1, HIGH); digitalWrite(pinIN2, LOW);
+    digitalWrite(ledStatus, HIGH);
+    bitClear(pcf_buffer, pcf_led_bit); // เปิด LED ที่ P7 (I2C)
+    lcd.print("Motor: REVERSE");
+    client.publish("esp32/motor/status", "REVERSE");
+    lastMoveMode = 1;
+  } 
+  else if (mode == 2) { // Reverse
+    digitalWrite(pinEN1, HIGH); digitalWrite(pinIN1, LOW); digitalWrite(pinIN2, HIGH);
+    digitalWrite(ledStatus, HIGH);
+    bitClear(pcf_buffer, pcf_led_bit); // เปิด LED ที่ P7 (I2C)
+    lcd.print("Motor: FORWARD");
+    client.publish("esp32/motor/status", "FORWARD");
+    lastMoveMode = 2;
+  } 
+  else { // Stop
+    digitalWrite(pinEN1, LOW); digitalWrite(pinIN1, LOW); digitalWrite(pinIN2, LOW);
+    digitalWrite(ledStatus, LOW);
+    bitSet(pcf_buffer, pcf_led_bit); // ปิด LED ที่ P7 (I2C)
+    lcd.print("Motor: STOPPED");
+    client.publish("esp32/motor/status", "STOPPED");
+    mode = 3; 
+  }
+  pcf_write(pcf_buffer); // ส่งค่าไป I2C ทุกครั้งที่เปลี่ยนสถานะ
+}
+
+void callback(char* topic, byte* payload, unsigned int length) {
+  String message = "";
+  for (int i = 0; i < length; i++) message += (char)payload[i];
+  
+  if (String(topic) == "esp32/motor/control") {
+    if (message == "FORWARD") updateAction(2);
+    else if (message == "REVERSE") updateAction(1);
+    else if (message == "STOP") updateAction(3);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  Wire.begin(21, 22);
+  
+  lcd.begin(); 
+  lcd.backlight();
+  lcd.print("System Booting");
+
+  pinMode(pinEN1, OUTPUT); pinMode(pinIN1, OUTPUT); pinMode(pinIN2, OUTPUT);
+  pinMode(ledStatus, OUTPUT); 
+  pinMode(nativeButtonPin, INPUT_PULLUP);
+
+  // เริ่มต้น I2C PCF8574 (บิต 0 เป็น Input)
+  bitSet(pcf_buffer, pcf_button_bit);
+  pcf_write(pcf_buffer);
+
+  WiFi.begin(ssid, password);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); }
+  
+  client.setServer(mqtt_server, 1883);
+  client.setCallback(callback);
+  updateAction(3); // เริ่มต้นที่โหมดหยุด
+}
+
+void reconnect() {
+  while (!client.connected()) {
+    if (client.connect(mqtt_client_id)) {
+      client.subscribe("esp32/motor/control");
+    } else { delay(5000); }
+  }
+}
+
+void loop() {
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  // 1. อ่านปุ่มจาก I2C (P0)
+  uint8_t i2cData = 0xFF;
+  Wire.requestFrom(PCF8574_ADDR, 1);
+  if (Wire.available()) i2cData = Wire.read();
+  bool pcf_pressed = (bitRead(i2cData, pcf_button_bit) == 0);
+
+  // 2. อ่านปุ่มจากบนบอร์ด (GPIO32)
+  int reading = digitalRead(nativeButtonPin);
+  
+  // Logic การกดปุ่ม (ใช้ตัวใดตัวหนึ่งกดก็ได้)
+  static bool isHolding = false;
+  if ((reading == LOW || pcf_pressed) && !isHolding) {
+    isHolding = true;
+    mode++;
+    if (mode > 3) mode = 1;
+    updateAction(mode);
+  } else if (reading == HIGH && !pcf_pressed) {
+    isHolding = false;
+  }
+
+  // รักษาบิต Input I2C
+  bitSet(pcf_buffer, pcf_button_bit);
+  delay(10);
+}
